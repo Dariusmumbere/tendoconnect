@@ -464,8 +464,8 @@ def settle(pid, recheck=False):
 # ---------------------------------------------------------------- health / settings
 @app.get("/api/health", tags=["System"])
 def health():
-    db("SELECT 1")
-    return {"status": "ok", "database": "up"}
+    """Plain liveness check — no database round-trip, so it stays fast and cheap to ping."""
+    return {"status": "ok"}
 
 
 @app.get("/api/settings/status", tags=["System"])
