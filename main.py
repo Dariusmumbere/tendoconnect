@@ -21,7 +21,7 @@ DATABASE_URL, SECRET_KEY = os.getenv("DATABASE_URL"), os.getenv("SECRET_KEY")
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")  # public https address of this app
 FRONTEND_URL = (os.getenv("FRONTEND_URL") or PUBLIC_BASE_URL).rstrip("/")  # where customers see their receipt
 PESAPAL_KEY, PESAPAL_SECRET = os.getenv("PESAPAL_CONSUMER_KEY"), os.getenv("PESAPAL_CONSUMER_SECRET")
-PESAPAL_ENV = os.getenv("PESAPAL_ENVIRONMENT", "sandbox").lower()  # "sandbox" or "live"
+PESAPAL_ENV = os.getenv("PESAPAL_ENVIRONMENT", "live").lower()  # "sandbox" or "live" — defaults to live, same as ScienceTech
 PESAPAL_BASE = "https://pay.pesapal.com/v3" if PESAPAL_ENV == "live" else "https://cybqa.pesapal.com/pesapalv3"
 PESAPAL_CALLBACK_URL = os.getenv("PESAPAL_CALLBACK_URL") or f"{PUBLIC_BASE_URL}/api/pesapal/callback"
 PESAPAL_IPN_URL = os.getenv("PESAPAL_IPN_URL") or f"{PUBLIC_BASE_URL}/api/pesapal/ipn"
