@@ -19,6 +19,7 @@ load_dotenv()
 log = logging.getLogger("tendoconnect")
 DATABASE_URL, SECRET_KEY = os.getenv("DATABASE_URL"), os.getenv("SECRET_KEY")
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")  # public https address of this app
+FRONTEND_URL = (os.getenv("FRONTEND_URL") or PUBLIC_BASE_URL).rstrip("/")  # where customers see their receipt
 PESAPAL_KEY, PESAPAL_SECRET = os.getenv("PESAPAL_CONSUMER_KEY"), os.getenv("PESAPAL_CONSUMER_SECRET")
 PESAPAL_ENV = os.getenv("PESAPAL_ENVIRONMENT", "sandbox").lower()  # "sandbox" or "live"
 PESAPAL_BASE = "https://pay.pesapal.com/v3" if PESAPAL_ENV == "live" else "https://cybqa.pesapal.com/pesapalv3"
@@ -114,6 +115,8 @@ app = FastAPI(title="TendoConnect Technologies API", version="1.0.0", lifespan=l
               description="Customers, packages, orders, payments, hotspots and sessions. "
                           "Payments are collected through Pesapal. Router (MikroTik) provisioning is not connected yet.")
 origins = [o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()]
+if FRONTEND_URL not in origins:
+    origins.append(FRONTEND_URL)
 app.add_middleware(CORSMiddleware, allow_origins=origins, allow_methods=["*"], allow_headers=["*"])
 
 
@@ -616,12 +619,12 @@ def pesapal_callback(request: Request):
     """The customer lands here after paying. The redirect is NOT trusted: we verify with Pesapal, then show the receipt."""
     p, _ = _pesapal_payment(request)
     if not p:
-        return RedirectResponse(f"{PUBLIC_BASE_URL}/", 302)
+        return RedirectResponse(f"{FRONTEND_URL}/", 302)
     try:
         settle(p["id"])
     except Exception:
         log.exception("Callback verification failed")  # the receipt page keeps re-checking
-    return RedirectResponse(f"{PUBLIC_BASE_URL}/#/receipt/{p['ref']}", 302)
+    return RedirectResponse(f"{FRONTEND_URL}/#/receipt/{p['ref']}", 302)
 
 
 @app.get("/api/pesapal/ipn", include_in_schema=False)
