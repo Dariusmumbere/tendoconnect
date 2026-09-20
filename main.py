@@ -1,15 +1,15 @@
 """TendoConnect Technologies - Customer & Hotspot Management API (single-file backend)."""
-import logging, os, re, secrets
+import logging, os, re, secrets, threading, time
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal, Optional
 
-import bcrypt, jwt, psycopg, psycopg_pool
+import bcrypt, jwt, psycopg, psycopg_pool, requests
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.security import HTTPBearer
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
@@ -18,9 +18,20 @@ from pydantic import BaseModel, Field, field_validator
 load_dotenv()
 log = logging.getLogger("tendoconnect")
 DATABASE_URL, SECRET_KEY = os.getenv("DATABASE_URL"), os.getenv("SECRET_KEY")
-PAYMENT_MODE = os.getenv("PAYMENT_MODE", "mock")  # "mock" | "pesapal" (pesapal not implemented yet)
-if not DATABASE_URL or not SECRET_KEY:
-    raise RuntimeError("DATABASE_URL and SECRET_KEY must be set (see .env.example).")
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")  # public https address of this app
+PESAPAL_KEY, PESAPAL_SECRET = os.getenv("PESAPAL_CONSUMER_KEY"), os.getenv("PESAPAL_CONSUMER_SECRET")
+PESAPAL_ENV = os.getenv("PESAPAL_ENVIRONMENT", "sandbox").lower()  # "sandbox" or "live"
+PESAPAL_BASE = "https://pay.pesapal.com/v3" if PESAPAL_ENV == "live" else "https://cybqa.pesapal.com/pesapalv3"
+PESAPAL_CALLBACK_URL = os.getenv("PESAPAL_CALLBACK_URL") or f"{PUBLIC_BASE_URL}/api/pesapal/callback"
+PESAPAL_IPN_URL = os.getenv("PESAPAL_IPN_URL") or f"{PUBLIC_BASE_URL}/api/pesapal/ipn"
+_missing = [k for k, v in {"DATABASE_URL": DATABASE_URL, "SECRET_KEY": SECRET_KEY, "PUBLIC_BASE_URL": PUBLIC_BASE_URL,
+                           "PESAPAL_CONSUMER_KEY": PESAPAL_KEY, "PESAPAL_CONSUMER_SECRET": PESAPAL_SECRET}.items() if not v]
+if _missing:
+    raise RuntimeError("Missing required environment variables: " + ", ".join(_missing) + " (see .env.example).")
+if len(SECRET_KEY) < 32:
+    raise RuntimeError("SECRET_KEY must be at least 32 characters.")
+if PESAPAL_ENV == "live" and not PUBLIC_BASE_URL.startswith("https://"):
+    raise RuntimeError("PUBLIC_BASE_URL must be an https:// address for live payments.")
 
 # ---------------------------------------------------------------- database
 pool = ConnectionPool(DATABASE_URL, min_size=1, max_size=5, open=False,
@@ -56,6 +67,7 @@ CREATE TABLE IF NOT EXISTS sessions(id SERIAL PRIMARY KEY, order_id INT NOT NULL
   mikrotik_username TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT now());
 CREATE TABLE IF NOT EXISTS admins(id SERIAL PRIMARY KEY, username TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now());
+CREATE INDEX IF NOT EXISTS ix_payments_txn ON payments(provider_txn_id);
 CREATE INDEX IF NOT EXISTS ix_orders_customer ON orders(customer_id);
 CREATE INDEX IF NOT EXISTS ix_payments_customer ON payments(customer_id, status);
 CREATE INDEX IF NOT EXISTS ix_sessions_customer ON sessions(customer_id, expires_at);
@@ -89,17 +101,27 @@ async def lifespan(_):
     if not db("SELECT 1 FROM packages LIMIT 1", one=True):  # starter packages, editable in the dashboard
         for n, p, d, u in SEED_PACKAGES:
             db("INSERT INTO packages(name,price,duration,duration_unit) VALUES(%s,%s,%s,%s)", (n, p, d, u))
-    if not db("SELECT 1 FROM hotspots LIMIT 1", one=True):
-        db("INSERT INTO hotspots(name,location,status) VALUES('TendoConnect - Main Hotspot','Kampala','Online')")
+    expire_stale()
+    try:
+        pp_ipn_id()  # register the IPN URL with Pesapal early so problems show in the logs at startup
+    except Exception as e:
+        log.warning("Pesapal IPN registration failed at startup: %s", e)
     yield
     pool.close()
 
 
 app = FastAPI(title="TendoConnect Technologies API", version="1.0.0", lifespan=lifespan,
               description="Customers, packages, orders, payments, hotspots and sessions. "
-                          "Payments run in MOCK mode; Pesapal and MikroTik are prepared but NOT integrated.")
+                          "Payments are collected through Pesapal. Router (MikroTik) provisioning is not connected yet.")
 origins = [o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()]
 app.add_middleware(CORSMiddleware, allow_origins=origins, allow_methods=["*"], allow_headers=["*"])
+
+
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    r = await call_next(request)
+    r.headers.update({"X-Content-Type-Options": "nosniff", "X-Frame-Options": "DENY", "Referrer-Policy": "same-origin"})
+    return r
 
 
 @app.exception_handler(psycopg.errors.UniqueViolation)
@@ -169,7 +191,8 @@ def auth_setup(b: Setup):
 
 
 @app.post("/api/auth/login", tags=["Auth"])
-def auth_login(b: Login):
+def auth_login(b: Login, request: Request):
+    throttle(request, "login", 10, 900)
     a = db("SELECT * FROM admins WHERE username=%s", (b.username.lower(),), one=True)
     if not a or not bcrypt.checkpw(b.password.encode(), a["password_hash"].encode()):
         raise HTTPException(401, "Wrong username or password.")
@@ -236,12 +259,6 @@ class OrderIn(BaseModel):
         return norm_phone(v)
 
 
-class MockPay(BaseModel):
-    order_ref: str
-    method: Literal["Mobile Money", "Card", "Cash", "Other"]
-    outcome: Literal["success", "failure"] = "success"
-
-
 class PortalIn(BaseModel):
     phone: str
     receipt: str = Field(min_length=4, max_length=40)
@@ -252,50 +269,106 @@ class PortalIn(BaseModel):
         return norm_phone(v)
 
 
-# ---------------------------------------------------------------- providers (swap points)
-class PaymentProvider:
-    """Interface. Implement PesapalProvider later without touching the order/session logic."""
-    def create_order(self, order: dict) -> dict: raise NotImplementedError
-    def verify(self, payment: dict) -> str: raise NotImplementedError  # -> Completed|Failed|Cancelled|Pending
+# ---------------------------------------------------------------- helpers
+_hits: dict = {}
 
 
-class MockPaymentProvider(PaymentProvider):
-    """Demo only. The mock endpoint stamps MOCK-OK-/MOCK-FAIL- ids; verify() reads that 'provider record'."""
-    def create_order(self, order): return {"redirect_url": None}
-
-    def verify(self, payment):
-        t = payment.get("provider_txn_id") or ""
-        return "Completed" if t.startswith("MOCK-OK-") else "Failed" if t.startswith("MOCK-FAIL-") else "Pending"
-
-
-class PesapalProvider(PaymentProvider):
-    """NOT IMPLEMENTED. Fill in using PESAPAL_* env vars: auth token -> SubmitOrderRequest -> GetTransactionStatus."""
-    def create_order(self, order): raise HTTPException(501, "Pesapal is not integrated yet.")
-    def verify(self, payment): raise HTTPException(501, "Pesapal is not integrated yet.")
+def throttle(request: Request, key: str, limit: int, window: int):
+    """Small in-memory per-IP rate limit (per process). Run uvicorn with --proxy-headers behind a proxy."""
+    now, k = time.time(), (key, request.client.host if request.client else "?")
+    h = [t for t in _hits.get(k, []) if now - t < window]
+    if len(h) >= limit:
+        raise HTTPException(429, "Too many attempts. Please wait a few minutes and try again.")
+    _hits[k] = h + [now]
 
 
-PAYMENT_PROVIDERS = {"Mock": MockPaymentProvider, "Pesapal": PesapalProvider}
+def expire_stale():
+    """Orders never paid within 6 hours are closed so they don't sit in 'Pending' forever."""
+    db("UPDATE payments SET status='Failed' WHERE status='Pending' AND created_at < now() - interval '6 hours'")
+    db("UPDATE orders SET status='Failed' WHERE status='Pending' AND created_at < now() - interval '6 hours'")
 
 
+# ---------------------------------------------------------------- Pesapal API v3
+_pp = {"token": None, "exp": 0.0, "ipn_id": os.getenv("PESAPAL_IPN_ID")}
+_pp_lock = threading.Lock()
+
+
+def pp_call(method, path, **kw):
+    headers = {"Accept": "application/json", "Content-Type": "application/json"}
+    if path != "/api/Auth/RequestToken":
+        headers["Authorization"] = "Bearer " + pp_token()
+    try:
+        r = requests.request(method, PESAPAL_BASE + path, headers=headers, timeout=25, **kw)
+        r.raise_for_status()
+        return r.json()
+    except (requests.RequestException, ValueError) as e:
+        log.error("Pesapal %s failed: %s %s", path, e, getattr(getattr(e, "response", None), "text", ""))
+        raise HTTPException(502, "The payment provider is not responding. Please try again in a moment.")
+
+
+def pp_token():
+    with _pp_lock:
+        if _pp["token"] and time.time() < _pp["exp"]:
+            return _pp["token"]
+        d = pp_call("POST", "/api/Auth/RequestToken", json={"consumer_key": PESAPAL_KEY, "consumer_secret": PESAPAL_SECRET})
+        if not d.get("token"):
+            log.error("Pesapal auth rejected: %s", {k: v for k, v in d.items() if k != "token"})
+            raise HTTPException(502, "Payments are temporarily unavailable. Please try again later.")
+        _pp["token"], _pp["exp"] = d["token"], time.time() + 240  # Pesapal tokens last ~5 minutes
+        return d["token"]
+
+
+def pp_ipn_id():
+    if not _pp["ipn_id"]:
+        d = pp_call("POST", "/api/URLSetup/RegisterIPN", json={"url": PESAPAL_IPN_URL, "ipn_notification_type": "GET"})
+        if not d.get("ipn_id"):
+            log.error("Pesapal IPN registration failed: %s", d)
+            raise HTTPException(502, "Payments are temporarily unavailable. Please try again later.")
+        _pp["ipn_id"] = d["ipn_id"]
+    return _pp["ipn_id"]
+
+
+def pp_submit(ref, amount, description, cu):
+    name = "TendoConnect Customer" if cu["full_name"] == "Hotspot customer" else cu["full_name"]
+    first, _, last = name.partition(" ")
+    d = pp_call("POST", "/api/Transactions/SubmitOrderRequest", json={
+        "id": ref, "currency": "UGX", "amount": float(amount), "description": description[:100],
+        "callback_url": PESAPAL_CALLBACK_URL, "notification_id": pp_ipn_id(),
+        "billing_address": {"email_address": cu["email"] or "", "phone_number": cu["phone"].lstrip("+"),
+                            "country_code": "UG", "first_name": first, "last_name": last}})
+    if d.get("error") or not d.get("redirect_url") or not d.get("order_tracking_id"):
+        log.error("Pesapal rejected order %s: %s", ref, d)
+        raise HTTPException(502, "We could not start the payment. Please try again.")
+    return d
+
+
+def pp_status(tracking_id):
+    return pp_call("GET", "/api/Transactions/GetTransactionStatus", params={"orderTrackingId": tracking_id})
+
+
+def pp_method(s):
+    s = (s or "").upper()
+    return "Mobile Money" if any(k in s for k in ("MTN", "AIRTEL", "MPESA", "MOBILE")) else \
+           "Card" if any(k in s for k in ("VISA", "MASTER", "CARD")) else "Other"
+
+
+# ---------------------------------------------------------------- hotspot access (swap point)
 class HotspotProvider:
     """Interface for controlling real internet access."""
     def create_user(self, username: str, profile: str, expires_at: datetime): raise NotImplementedError
     def disable_user(self, username: str): raise NotImplementedError
 
 
-class MockHotspotProvider(HotspotProvider):
-    def create_user(self, username, profile, expires_at): log.info("[mock hotspot] user %s (%s) until %s", username, profile, expires_at)
-    def disable_user(self, username): log.info("[mock hotspot] disable %s", username)
-
-
-class MikroTikProvider(HotspotProvider):
-    """NOT IMPLEMENTED. Uses MIKROTIK_HOST/USERNAME/PASSWORD/PORT (RouterOS API); credentials stay server-side."""
-    def create_user(self, username, profile, expires_at): raise NotImplementedError("MikroTik is not integrated yet.")
-    def disable_user(self, username): raise NotImplementedError("MikroTik is not integrated yet.")
+class ManualHotspotProvider(HotspotProvider):
+    """Router NOT connected: paid sessions are recorded in the database only. Replace with a MikroTik provider."""
+    def create_user(self, username, profile, expires_at): log.info("Paid session recorded - provision on router: %s (%s) until %s", username, profile, expires_at)
+    def disable_user(self, username): log.info("Session ended - disable on router: %s", username)
 
 
 def hotspot_provider() -> HotspotProvider:
-    return MikroTikProvider() if os.getenv("MIKROTIK_HOST") else MockHotspotProvider()
+    if os.getenv("MIKROTIK_HOST"):
+        log.warning("MIKROTIK_HOST is set but the MikroTik provider is not implemented; using manual provisioning.")
+    return ManualHotspotProvider()
 
 
 # ---------------------------------------------------------------- SQL fragments
@@ -331,26 +404,43 @@ def activate(c, p):
     start = max(now, last) if last else now  # a new purchase extends an unexpired one
     expires = start + timedelta(**{pk["duration_unit"].lower(): pk["duration"]})
     username = "tc" + re.sub(r"\D", "", cu["phone"])
-    hotspot_provider().create_user(username, pk["name"], expires)
     db("INSERT INTO sessions(order_id,customer_id,package_id,hotspot_id,started_at,expires_at,mikrotik_username) VALUES(%s,%s,%s,%s,%s,%s,%s)",
        (o["id"], cu["id"], pk["id"], hs, start, expires, username), conn=c)
+    try:
+        hotspot_provider().create_user(username, pk["name"], expires)
+    except Exception:  # never lose a verified payment because the router step failed
+        log.exception("Router provisioning failed for paid order %s", o["ref"])
     db("UPDATE payments SET status='Completed',paid_at=now() WHERE id=%s", (p["id"],), conn=c)
     db("UPDATE orders SET status='Paid' WHERE id=%s", (o["id"],), conn=c)
     db("UPDATE customers SET status='Active' WHERE id=%s AND status='Inactive'", (cu["id"],), conn=c)
 
 
-def settle(pid):
-    """Verify with the provider (server-side) and activate if - and only if - it is Completed. Idempotent."""
+def settle(pid, recheck=False):
+    """Ask Pesapal (server to server) for the real status and act on it. Idempotent; the ONLY path that activates a package."""
+    p = found(db("SELECT p.*,o.ref FROM payments p JOIN orders o ON o.id=p.order_id WHERE p.id=%s", (pid,), one=True), "Payment not found.")
+    if not p["provider_txn_id"] or not (p["status"] == "Pending" or (recheck and p["status"] == "Completed")):
+        return p["status"]
+    st = pp_status(p["provider_txn_id"])
+    desc, code = (st.get("payment_status_description") or "").upper(), st.get("status_code")
+    if st.get("merchant_reference") not in (None, "", p["ref"]):
+        log.critical("Pesapal reference mismatch on payment %s: %s", pid, st)
+        return p["status"]
     with pool.connection() as c:
-        p = found(db("SELECT * FROM payments WHERE id=%s FOR UPDATE", (pid,), one=True, conn=c), "Payment not found.")
+        p = db("SELECT * FROM payments WHERE id=%s FOR UPDATE", (pid,), one=True, conn=c)
         if p["status"] == "Pending":
-            status = PAYMENT_PROVIDERS[p["provider"]]().verify(p)
-            if status == "Completed":
+            if desc == "COMPLETED" or code == 1:
+                if (st.get("currency") or p["currency"]) != p["currency"] or float(st.get("amount") or 0) < p["amount"]:
+                    log.critical("Pesapal amount/currency mismatch on payment %s: %s", pid, st)
+                    return p["status"]
+                db("UPDATE payments SET method=%s WHERE id=%s", (pp_method(st.get("payment_method")), pid), conn=c)
                 activate(c, p)
-            elif status in ("Failed", "Cancelled"):
-                db("UPDATE payments SET status=%s WHERE id=%s", (status, pid), conn=c)
-                db("UPDATE orders SET status=%s WHERE id=%s", (status, p["order_id"]), conn=c)
-        return db("SELECT id,status FROM payments WHERE id=%s", (pid,), one=True, conn=c)
+            elif desc in ("FAILED", "REVERSED") or code in (2, 3):  # INVALID can still be an unpaid order, so it stays Pending
+                db("UPDATE payments SET status='Failed' WHERE id=%s", (pid,), conn=c)
+                db("UPDATE orders SET status='Failed' WHERE id=%s", (p["order_id"],), conn=c)
+        elif p["status"] == "Completed" and (desc == "REVERSED" or code == 3):  # money returned to the customer
+            db("UPDATE payments SET status='Refunded' WHERE id=%s", (pid,), conn=c)
+            db("UPDATE sessions SET status='Terminated' WHERE order_id=%s", (p["order_id"],), conn=c)
+        return db("SELECT status FROM payments WHERE id=%s", (pid,), one=True, conn=c)["status"]
 
 
 # ---------------------------------------------------------------- health / settings
@@ -362,9 +452,14 @@ def health():
 
 @app.get("/api/settings/status", tags=["System"])
 def settings_status(_=Depends(admin)):
-    return {"payment_mode": PAYMENT_MODE,
-            "pesapal_configured": bool(os.getenv("PESAPAL_CONSUMER_KEY") and os.getenv("PESAPAL_CONSUMER_SECRET")),
-            "pesapal_integrated": False, "mikrotik_configured": bool(os.getenv("MIKROTIK_HOST")), "mikrotik_integrated": False}
+    """Live check that Pesapal accepts our credentials. No secrets are returned."""
+    try:
+        pp_token()
+        ok = True
+    except HTTPException:
+        ok = False
+    return {"pesapal_environment": PESAPAL_ENV, "pesapal_credentials_ok": ok, "callback_url": PESAPAL_CALLBACK_URL,
+            "ipn_url": PESAPAL_IPN_URL, "ipn_registered": bool(_pp["ipn_id"]), "router_provisioning": "manual"}
 
 
 # ---------------------------------------------------------------- customers
@@ -447,20 +542,29 @@ def order_view(ref):
 
 
 @app.post("/api/orders", status_code=201, tags=["Orders"])
-def orders_create(b: OrderIn):
-    """Public. Step 1 of the flow: creates the customer (if new), an order and a Pending payment."""
-    provider = "Mock" if PAYMENT_MODE == "mock" else "Pesapal"
+def orders_create(b: OrderIn, request: Request):
+    """Public. Creates the order and a Pending payment, registers it with Pesapal and returns the hosted payment page URL."""
+    throttle(request, "order", 8, 600)
     ref = "TC-" + secrets.token_hex(6).upper()
     with pool.connection() as c:
         pk = found(db("SELECT * FROM packages WHERE id=%s AND active", (b.package_id,), one=True, conn=c), "That package is not available.")
+        if pk["price"] <= 0:
+            raise HTTPException(400, "This package cannot be purchased online.")
         cu = db("INSERT INTO customers(full_name,phone) VALUES('Hotspot customer',%s) ON CONFLICT(phone) DO UPDATE SET phone=EXCLUDED.phone RETURNING *", (b.phone,), one=True, conn=c)
         if cu["status"] == "Suspended":
             raise HTTPException(403, "This account is suspended. Please contact TendoConnect support.")
         o = db("INSERT INTO orders(ref,customer_id,package_id,hotspot_id,amount) VALUES(%s,%s,%s,%s,%s) RETURNING *",
                (ref, cu["id"], pk["id"], b.hotspot_id, pk["price"]), one=True, conn=c)
-        db("INSERT INTO payments(order_id,customer_id,package_id,amount,provider) VALUES(%s,%s,%s,%s,%s)", (o["id"], cu["id"], pk["id"], pk["price"], provider), conn=c)
-        PAYMENT_PROVIDERS[provider]().create_order(o)
-    return order_view(ref)
+        p = db("INSERT INTO payments(order_id,customer_id,package_id,amount,provider) VALUES(%s,%s,%s,%s,'Pesapal') RETURNING id",
+               (o["id"], cu["id"], pk["id"], pk["price"]), one=True, conn=c)
+    try:
+        d = pp_submit(ref, pk["price"], f"TendoConnect {pk['name']}", cu)
+    except Exception:
+        db("UPDATE payments SET status='Failed' WHERE id=%s", (p["id"],))
+        db("UPDATE orders SET status='Failed' WHERE id=%s", (o["id"],))
+        raise
+    db("UPDATE payments SET provider_txn_id=%s WHERE id=%s", (d["order_tracking_id"], p["id"]))
+    return {**order_view(ref), "redirect_url": d["redirect_url"]}
 
 
 @app.get("/api/orders/{ref}", tags=["Orders"])
@@ -469,24 +573,13 @@ def orders_get(ref: str):
     return order_view(ref.upper())
 
 
-@app.post("/api/payments/mock", tags=["Payments"])
-def payments_mock(b: MockPay):
-    """MOCK ONLY (PAYMENT_MODE=mock). Simulates the provider; the backend still verifies before activating."""
-    if PAYMENT_MODE != "mock":
-        raise HTTPException(403, "Mock payments are disabled.")
-    p = found(db("SELECT p.* FROM payments p JOIN orders o ON o.id=p.order_id WHERE o.ref=%s", (b.order_ref.upper(),), one=True), "Order not found.")
-    if p["status"] != "Pending":
-        raise HTTPException(409, "This payment was already processed.")
-    txn = f"MOCK-{'OK' if b.outcome == 'success' else 'FAIL'}-{secrets.token_hex(4).upper()}"
-    db("UPDATE payments SET method=%s,provider_txn_id=%s WHERE id=%s", (b.method, txn, p["id"]))
+@app.get("/api/payments/status/{ref}", tags=["Payments"])
+def payments_status(ref: str, request: Request):
+    """Public, by order reference. Re-verifies a pending payment directly with Pesapal and activates it once confirmed."""
+    throttle(request, "status", 90, 60)
+    p = found(db("SELECT p.id FROM payments p JOIN orders o ON o.id=p.order_id WHERE o.ref=%s", (ref.upper(),), one=True), "Order not found.")
     settle(p["id"])
-    return order_view(b.order_ref.upper())
-
-
-@app.get("/api/payments/status/{pid}", tags=["Payments"])
-def payments_status(pid: int):
-    """Re-verifies a pending payment with its provider and returns only the status."""
-    return settle(pid)
+    return order_view(ref.upper())
 
 
 @app.get("/api/payments", tags=["Payments"])
@@ -511,16 +604,39 @@ def payments_confirm_cash(pid: int, _=Depends(admin)):
     return {"ok": True}
 
 
-@app.get("/api/pesapal/callback", tags=["Pesapal (placeholder)"])
-def pesapal_callback():
-    """TODO: Pesapal redirects the customer here. Look up the order, call settle(); never trust the redirect itself."""
-    raise HTTPException(501, "Pesapal is not integrated yet.")
+def _pesapal_payment(request: Request):
+    q = {k.lower(): v for k, v in request.query_params.items()}
+    p = db("SELECT p.id,o.ref FROM payments p JOIN orders o ON o.id=p.order_id WHERE o.ref=%s OR p.provider_txn_id=%s",
+           (q.get("ordermerchantreference", ""), q.get("ordertrackingid", "")), one=True)
+    return p, q
 
 
-@app.post("/api/pesapal/ipn", tags=["Pesapal (placeholder)"])
+@app.get("/api/pesapal/callback", include_in_schema=False)
+def pesapal_callback(request: Request):
+    """The customer lands here after paying. The redirect is NOT trusted: we verify with Pesapal, then show the receipt."""
+    p, _ = _pesapal_payment(request)
+    if not p:
+        return RedirectResponse(f"{PUBLIC_BASE_URL}/", 302)
+    try:
+        settle(p["id"])
+    except Exception:
+        log.exception("Callback verification failed")  # the receipt page keeps re-checking
+    return RedirectResponse(f"{PUBLIC_BASE_URL}/#/receipt/{p['ref']}", 302)
+
+
+@app.get("/api/pesapal/ipn", include_in_schema=False)
 def pesapal_ipn(request: Request):
-    """TODO: IPN webhook. Take the tracking id, call PesapalProvider.verify() via settle(), then reply as Pesapal requires."""
-    raise HTTPException(501, "Pesapal is not integrated yet.")
+    """Pesapal's server-to-server notification (registered as a GET IPN). Verifies, activates, and replies as Pesapal requires."""
+    p, q = _pesapal_payment(request)
+    echo = {"orderNotificationType": q.get("ordernotificationtype", ""), "orderTrackingId": q.get("ordertrackingid", ""),
+            "orderMerchantReference": q.get("ordermerchantreference", "")}
+    try:
+        if p:
+            settle(p["id"], recheck=True)
+    except Exception:
+        log.exception("IPN processing failed")
+        return JSONResponse({**echo, "status": 500}, 500)  # non-200 makes Pesapal retry
+    return {**echo, "status": 200}
 
 
 # ---------------------------------------------------------------- hotspots & sessions
@@ -561,6 +677,7 @@ def sessions_terminate(sid: int, _=Depends(admin)):
 # ---------------------------------------------------------------- dashboard, reports, portal
 @app.get("/api/dashboard/stats", tags=["Dashboard"])
 def dashboard_stats(_=Depends(admin)):
+    expire_stale()
     return db(f"""SELECT (SELECT count(*) FROM customers)::int AS total_customers,
       (SELECT count(*) FROM customers WHERE status='Active')::int AS active_customers,
       (SELECT COALESCE(sum(amount),0) FROM payments WHERE status='Completed' AND paid_at>={since('day')})::int AS revenue_today,
@@ -583,8 +700,9 @@ def reports(_=Depends(admin)):
 
 
 @app.post("/api/portal/lookup", tags=["Public"])
-def portal_lookup(b: PortalIn):
+def portal_lookup(b: PortalIn, request: Request):
     """Customer portal. Needs the phone number AND a receipt code from one of that customer's purchases."""
+    throttle(request, "portal", 10, 600)
     c = found(db("SELECT c.id,c.full_name FROM customers c JOIN orders o ON o.customer_id=c.id WHERE c.phone=%s AND o.ref=%s",
                  (b.phone, b.receipt.strip().upper()), one=True), "No match. Check your phone number and a receipt code from one of your purchases.")
     return {"name": c["full_name"],
