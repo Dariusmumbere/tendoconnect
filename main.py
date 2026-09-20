@@ -348,11 +348,14 @@ def pp_ipn_id():
 def pp_submit(ref, amount, description, cu):
     name = "TendoConnect Customer" if cu["full_name"] == "Hotspot customer" else cu["full_name"]
     first, _, last = name.partition(" ")
+    digits = re.sub(r"\D", "", cu["phone"])
+    local_phone = "0" + digits[3:] if digits.startswith("256") and len(digits) == 12 else digits
     d = pp_call("POST", "/api/Transactions/SubmitOrderRequest", json={
         "id": ref, "currency": "UGX", "amount": float(amount), "description": description[:100],
         "callback_url": PESAPAL_CALLBACK_URL, "notification_id": pp_ipn_id(),
-        "billing_address": {"email_address": cu["email"] or "", "phone_number": cu["phone"].lstrip("+"),
-                            "country_code": "UG", "first_name": first, "last_name": last}})
+        "billing_address": {"email_address": cu["email"] or "", "phone_number": local_phone, "country_code": "UG",
+                            "first_name": first or "Hotspot", "last_name": last or "Customer",
+                            "line_1": "", "line_2": "", "city": "", "state": "", "postal_code": "", "zip_code": ""}})
     if d.get("error") or not d.get("redirect_url") or not d.get("order_tracking_id"):
         log.error("Pesapal rejected order %s: %s", ref, d)
         raise HTTPException(502, "We could not start the payment. Please try again.")
