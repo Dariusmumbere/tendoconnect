@@ -65,7 +65,9 @@ CREATE TABLE IF NOT EXISTS sessions(id SERIAL PRIMARY KEY, order_id INT NOT NULL
   customer_id INT NOT NULL REFERENCES customers(id), package_id INT NOT NULL REFERENCES packages(id),
   hotspot_id INT REFERENCES hotspots(id), started_at TIMESTAMPTZ NOT NULL, expires_at TIMESTAMPTZ NOT NULL,
   status TEXT NOT NULL DEFAULT 'Active' CHECK(status IN('Active','Expired','Suspended','Terminated')),
-  mikrotik_username TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT now());
+  mikrotik_username TEXT, voucher_code TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT now());
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS voucher_code TEXT;
+CREATE UNIQUE INDEX IF NOT EXISTS ix_sessions_voucher ON sessions(voucher_code) WHERE voucher_code IS NOT NULL;
 CREATE TABLE IF NOT EXISTS admins(id SERIAL PRIMARY KEY, username TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now());
 CREATE INDEX IF NOT EXISTS ix_payments_txn ON payments(provider_txn_id);
@@ -73,8 +75,8 @@ CREATE INDEX IF NOT EXISTS ix_orders_customer ON orders(customer_id);
 CREATE INDEX IF NOT EXISTS ix_payments_customer ON payments(customer_id, status);
 CREATE INDEX IF NOT EXISTS ix_sessions_customer ON sessions(customer_id, expires_at);
 """
-SEED_PACKAGES = [("1 Hour", 500, 1, "Hours"), ("3 Hours", 1000, 3, "Hours"), ("12 Hours", 1500, 12, "Hours"),
-                 ("24 Hours", 2000, 24, "Hours"), ("7 Days", 7000, 7, "Days"), ("30 Days", 20000, 30, "Days")]
+SEED_PACKAGES = [("5 Hours", 500, 5, "Hours"), ("24 Hours", 1000, 24, "Hours"), ("1 Week", 5000, 7, "Days"),
+                 ("2 Weeks", 10000, 14, "Days"), ("1 Month", 20000, 30, "Days")]
 
 
 def db(sql, args=(), one=False, conn=None):
@@ -285,6 +287,18 @@ def throttle(request: Request, key: str, limit: int, window: int):
     _hits[k] = h + [now]
 
 
+VOUCHER_CHARS = "23456789ABCDEFGHJKMNPQRSTUVWXYZ"  # no 0/O/1/I/L, so codes are easy to read aloud or retype
+
+
+def gen_voucher(conn):
+    """Short customer-facing code, distinct from the internal MikroTik username. Retries on the rare collision."""
+    for _ in range(5):
+        code = "-".join("".join(secrets.choice(VOUCHER_CHARS) for _ in range(4)) for _ in range(2))
+        if not db("SELECT 1 FROM sessions WHERE voucher_code=%s", (code,), one=True, conn=conn):
+            return code
+    raise HTTPException(500, "Could not generate a voucher code. Please try again.")
+
+
 def expire_stale():
     """Orders never paid within 6 hours are closed so they don't sit in 'Pending' forever."""
     db("UPDATE payments SET status='Failed' WHERE status='Pending' AND created_at < now() - interval '6 hours'")
@@ -385,7 +399,7 @@ PAY = """SELECT p.id,o.ref AS order_ref,p.customer_id,c.full_name AS customer,c.
   p.method,p.provider,p.provider_txn_id,p.status,p.created_at,p.paid_at FROM payments p JOIN orders o ON o.id=p.order_id
   JOIN customers c ON c.id=p.customer_id JOIN packages k ON k.id=p.package_id"""
 SESS = """SELECT s.id,s.customer_id,c.full_name AS customer,k.name AS package,h.name AS hotspot,s.started_at,s.expires_at,
-  CASE WHEN s.status='Active' AND s.expires_at<=now() THEN 'Expired' ELSE s.status END AS status,s.mikrotik_username
+  CASE WHEN s.status='Active' AND s.expires_at<=now() THEN 'Expired' ELSE s.status END AS status,s.mikrotik_username,s.voucher_code
   FROM sessions s JOIN customers c ON c.id=s.customer_id JOIN packages k ON k.id=s.package_id
   LEFT JOIN hotspots h ON h.id=s.hotspot_id"""
 LIVE = " s.status='Active' AND s.expires_at>now()"
@@ -407,8 +421,9 @@ def activate(c, p):
     start = max(now, last) if last else now  # a new purchase extends an unexpired one
     expires = start + timedelta(**{pk["duration_unit"].lower(): pk["duration"]})
     username = "tc" + re.sub(r"\D", "", cu["phone"])
-    db("INSERT INTO sessions(order_id,customer_id,package_id,hotspot_id,started_at,expires_at,mikrotik_username) VALUES(%s,%s,%s,%s,%s,%s,%s)",
-       (o["id"], cu["id"], pk["id"], hs, start, expires, username), conn=c)
+    voucher = gen_voucher(c)
+    db("INSERT INTO sessions(order_id,customer_id,package_id,hotspot_id,started_at,expires_at,mikrotik_username,voucher_code) VALUES(%s,%s,%s,%s,%s,%s,%s,%s)",
+       (o["id"], cu["id"], pk["id"], hs, start, expires, username, voucher), conn=c)
     try:
         hotspot_provider().create_user(username, pk["name"], expires)
     except Exception:  # never lose a verified payment because the router step failed
@@ -710,8 +725,12 @@ def portal_lookup(b: PortalIn, request: Request):
                  (b.phone, b.receipt.strip().upper()), one=True), "No match. Check your phone number and a receipt code from one of your purchases.")
     return {"name": c["full_name"],
             "current_session": db(SESS + " WHERE s.customer_id=%s AND" + LIVE + " ORDER BY s.expires_at DESC LIMIT 1", (c["id"],), one=True),
-            "purchases": db("SELECT o.ref,k.name AS package,p.amount,p.currency,p.method,p.status,p.created_at FROM payments p "
-                            "JOIN orders o ON o.id=p.order_id JOIN packages k ON k.id=p.package_id WHERE p.customer_id=%s ORDER BY p.id DESC LIMIT 100", (c["id"],))}
+            "purchases": db("""SELECT o.ref,k.name AS package,p.amount,p.currency,p.method,p.status,p.created_at,
+                                s.voucher_code,s.expires_at AS voucher_expires,
+                                CASE WHEN s.status='Active' AND s.expires_at<=now() THEN 'Expired' ELSE s.status END AS voucher_status
+                                FROM payments p JOIN orders o ON o.id=p.order_id JOIN packages k ON k.id=p.package_id
+                                LEFT JOIN sessions s ON s.order_id=o.id
+                                WHERE p.customer_id=%s ORDER BY p.id DESC LIMIT 100""", (c["id"],))}
 
 
 @app.get("/", include_in_schema=False)
