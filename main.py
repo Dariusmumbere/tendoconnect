@@ -70,10 +70,20 @@ ALTER TABLE sessions ADD COLUMN IF NOT EXISTS voucher_code TEXT;
 CREATE UNIQUE INDEX IF NOT EXISTS ix_sessions_voucher ON sessions(voucher_code) WHERE voucher_code IS NOT NULL;
 CREATE TABLE IF NOT EXISTS admins(id SERIAL PRIMARY KEY, username TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now());
+ALTER TABLE admins ADD COLUMN IF NOT EXISTS role TEXT NOT NULL DEFAULT 'Admin' CHECK(role IN('Admin','SuperAdmin'));
+ALTER TABLE admins ADD COLUMN IF NOT EXISTS active BOOLEAN NOT NULL DEFAULT true;
+CREATE TABLE IF NOT EXISTS withdrawals(id SERIAL PRIMARY KEY, admin_id INT NOT NULL REFERENCES admins(id),
+  admin_username TEXT NOT NULL, amount INT NOT NULL CHECK(amount>0),
+  method TEXT NOT NULL DEFAULT 'Mobile Money' CHECK(method IN('Mobile Money','Bank Transfer','Cash')),
+  destination TEXT NOT NULL DEFAULT '', notes TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'Pending' CHECK(status IN('Pending','Paid','Rejected')),
+  requested_at TIMESTAMPTZ NOT NULL DEFAULT now(), processed_at TIMESTAMPTZ, processed_by TEXT, reject_reason TEXT NOT NULL DEFAULT '');
 CREATE INDEX IF NOT EXISTS ix_payments_txn ON payments(provider_txn_id);
 CREATE INDEX IF NOT EXISTS ix_orders_customer ON orders(customer_id);
 CREATE INDEX IF NOT EXISTS ix_payments_customer ON payments(customer_id, status);
 CREATE INDEX IF NOT EXISTS ix_sessions_customer ON sessions(customer_id, expires_at);
+CREATE INDEX IF NOT EXISTS ix_withdrawals_status ON withdrawals(status);
+CREATE INDEX IF NOT EXISTS ix_withdrawals_admin ON withdrawals(admin_id);
 """
 SEED_PACKAGES = [("5 Hours", 500, 5, "Hours"), ("24 Hours", 1000, 24, "Hours"), ("1 Week", 5000, 7, "Days"),
                  ("2 Weeks", 10000, 14, "Days"), ("1 Month", 20000, 30, "Days")]
@@ -104,6 +114,9 @@ async def lifespan(_):
     if not db("SELECT 1 FROM packages LIMIT 1", one=True):  # starter packages, editable in the dashboard
         for n, p, d, u in SEED_PACKAGES:
             db("INSERT INTO packages(name,price,duration,duration_unit) VALUES(%s,%s,%s,%s)", (n, p, d, u))
+    # Databases created before roles existed get their earliest admin promoted, so nobody is locked out.
+    if db("SELECT 1 FROM admins LIMIT 1", one=True) and not db("SELECT 1 FROM admins WHERE role='SuperAdmin' LIMIT 1", one=True):
+        db("UPDATE admins SET role='SuperAdmin' WHERE id=(SELECT id FROM admins ORDER BY id LIMIT 1)")
     expire_stale()
     try:
         pp_ipn_id()  # register the IPN URL with Pesapal early so problems show in the logs at startup
@@ -157,9 +170,16 @@ bearer = HTTPBearer(auto_error=False)
 
 def admin(cred=Depends(bearer)):
     try:
-        return jwt.decode(cred.credentials, SECRET_KEY, algorithms=["HS256"])["sub"]
+        return jwt.decode(cred.credentials, SECRET_KEY, algorithms=["HS256"])
     except Exception:
         raise HTTPException(401, "Please sign in again.")
+
+
+def super_admin(a=Depends(admin)):
+    """Gate for actions only a super admin may take, such as disbursing a withdrawal or managing admin accounts."""
+    if a.get("role") != "SuperAdmin":
+        raise HTTPException(403, "Only super admins can do this.")
+    return a
 
 
 class Login(BaseModel):
@@ -172,9 +192,21 @@ class Setup(Login):
     setup_key: str
 
 
-def token_for(username):
+class AdminIn(BaseModel):
+    username: str = Field(min_length=3, max_length=50)
+    password: Optional[str] = Field(None, min_length=8, max_length=200)  # required on create; leave blank on edit to keep it
+    role: Literal["Admin", "SuperAdmin"] = "Admin"
+    active: bool = True
+
+    @field_validator("password", mode="before")
+    @classmethod
+    def _blank_password(cls, v):
+        return v or None
+
+
+def token_for(a):
     exp = datetime.now(timezone.utc) + timedelta(hours=8)
-    return jwt.encode({"sub": username, "exp": exp}, SECRET_KEY, algorithm="HS256")
+    return jwt.encode({"sub": a["username"], "aid": a["id"], "role": a["role"], "exp": exp}, SECRET_KEY, algorithm="HS256")
 
 
 @app.get("/api/auth/status", tags=["Auth"])
@@ -185,14 +217,14 @@ def auth_status():
 
 @app.post("/api/auth/setup", status_code=201, tags=["Auth"])
 def auth_setup(b: Setup):
-    """Create the first admin. Only works while no admin exists and requires SECRET_KEY as setup_key."""
+    """Create the first admin, as a super admin. Only works while no admin exists and requires SECRET_KEY as setup_key."""
     if db("SELECT 1 FROM admins LIMIT 1", one=True):
         raise HTTPException(409, "An admin already exists.")
     if not secrets.compare_digest(b.setup_key, SECRET_KEY):
         raise HTTPException(403, "Invalid setup key.")
     h = bcrypt.hashpw(b.password.encode(), bcrypt.gensalt()).decode()
-    db("INSERT INTO admins(username,password_hash) VALUES(%s,%s)", (b.username.lower(), h))
-    return {"token": token_for(b.username.lower())}
+    a = db("INSERT INTO admins(username,password_hash,role) VALUES(%s,%s,'SuperAdmin') RETURNING *", (b.username.lower(), h), one=True)
+    return {"token": token_for(a), "username": a["username"], "role": a["role"]}
 
 
 @app.post("/api/auth/login", tags=["Auth"])
@@ -201,7 +233,61 @@ def auth_login(b: Login, request: Request):
     a = db("SELECT * FROM admins WHERE username=%s", (b.username.lower(),), one=True)
     if not a or not bcrypt.checkpw(b.password.encode(), a["password_hash"].encode()):
         raise HTTPException(401, "Wrong username or password.")
-    return {"token": token_for(a["username"])}
+    if not a["active"]:
+        raise HTTPException(403, "This admin account has been disabled. Contact a super admin.")
+    return {"token": token_for(a), "username": a["username"], "role": a["role"]}
+
+
+# ---------------------------------------------------------------- admin accounts (super admin only)
+def _active_superadmins(exclude_id=None, conn=None):
+    """Counts active super admins, optionally excluding one — used to stop the last one being demoted/deleted/disabled."""
+    if exclude_id:
+        return db("SELECT count(*)::int AS n FROM admins WHERE role='SuperAdmin' AND active AND id<>%s", (exclude_id,), one=True, conn=conn)["n"]
+    return db("SELECT count(*)::int AS n FROM admins WHERE role='SuperAdmin' AND active", one=True, conn=conn)["n"]
+
+
+@app.get("/api/admins", tags=["Admins"])
+def admins_list(_=Depends(super_admin)):
+    return db("SELECT id,username,role,active,created_at FROM admins ORDER BY id")
+
+
+@app.post("/api/admins", status_code=201, tags=["Admins"])
+def admins_create(b: AdminIn, _=Depends(super_admin)):
+    """A super admin creates another admin account — regular or, to add another super admin, role='SuperAdmin'."""
+    if not b.password:
+        raise HTTPException(422, "A password is required for a new admin.")
+    h = bcrypt.hashpw(b.password.encode(), bcrypt.gensalt()).decode()
+    return db("INSERT INTO admins(username,password_hash,role,active) VALUES(%s,%s,%s,%s) RETURNING id,username,role,active,created_at",
+              (b.username.lower(), h, b.role, b.active), one=True)
+
+
+@app.put("/api/admins/{aid}", tags=["Admins"])
+def admins_update(aid: int, b: AdminIn, _=Depends(super_admin)):
+    with pool.connection() as c:
+        cur = found(db("SELECT * FROM admins WHERE id=%s FOR UPDATE", (aid,), one=True, conn=c), "Admin not found.")
+        stays_active_super = b.role == "SuperAdmin" and b.active
+        if cur["role"] == "SuperAdmin" and cur["active"] and not stays_active_super and _active_superadmins(exclude_id=aid, conn=c) < 1:
+            raise HTTPException(400, "At least one active super admin is required.")
+        if b.password:
+            h = bcrypt.hashpw(b.password.encode(), bcrypt.gensalt()).decode()
+            row = db("UPDATE admins SET username=%s,password_hash=%s,role=%s,active=%s WHERE id=%s RETURNING id,username,role,active,created_at",
+                     (b.username.lower(), h, b.role, b.active, aid), one=True, conn=c)
+        else:
+            row = db("UPDATE admins SET username=%s,role=%s,active=%s WHERE id=%s RETURNING id,username,role,active,created_at",
+                     (b.username.lower(), b.role, b.active, aid), one=True, conn=c)
+    return row
+
+
+@app.delete("/api/admins/{aid}", tags=["Admins"])
+def admins_delete(aid: int, a=Depends(super_admin)):
+    if aid == a["aid"]:
+        raise HTTPException(400, "You cannot delete your own account.")
+    with pool.connection() as c:
+        cur = found(db("SELECT * FROM admins WHERE id=%s FOR UPDATE", (aid,), one=True, conn=c), "Admin not found.")
+        if cur["role"] == "SuperAdmin" and cur["active"] and _active_superadmins(exclude_id=aid, conn=c) < 1:
+            raise HTTPException(400, "At least one active super admin is required.")
+        db("DELETE FROM admins WHERE id=%s", (aid,), conn=c)
+    return {"ok": True}
 
 
 # ---------------------------------------------------------------- models
@@ -272,6 +358,17 @@ class PortalIn(BaseModel):
     @classmethod
     def _phone(cls, v):
         return norm_phone(v)
+
+
+class WithdrawalIn(BaseModel):
+    amount: int = Field(gt=0, le=100_000_000)
+    method: Literal["Mobile Money", "Bank Transfer", "Cash"] = "Mobile Money"
+    destination: str = Field("", max_length=200)
+    notes: str = Field("", max_length=300)
+
+
+class RejectIn(BaseModel):
+    reason: str = Field("", max_length=300)
 
 
 # ---------------------------------------------------------------- helpers
@@ -660,6 +757,69 @@ def pesapal_ipn(request: Request):
     return {**echo, "status": 200}
 
 
+# ---------------------------------------------------------------- withdrawals
+WD = """SELECT w.id,w.admin_id,w.admin_username,w.amount,w.method,w.destination,w.notes,w.status,
+  w.requested_at,w.processed_at,w.processed_by,w.reject_reason FROM withdrawals w"""
+
+
+def _wallet():
+    """Company funds ledger: completed revenue minus what's already been disbursed or is committed to pending requests."""
+    row = db("""SELECT (SELECT COALESCE(sum(amount),0) FROM payments WHERE status='Completed')::int AS revenue,
+                       (SELECT COALESCE(sum(amount),0) FROM withdrawals WHERE status='Paid')::int AS paid,
+                       (SELECT COALESCE(sum(amount),0) FROM withdrawals WHERE status='Pending')::int AS pending""", one=True)
+    row["available"] = row["revenue"] - row["paid"] - row["pending"]
+    return row
+
+
+@app.get("/api/withdrawals/balance", tags=["Withdrawals"])
+def withdrawals_balance(_=Depends(admin)):
+    return _wallet()
+
+
+@app.get("/api/withdrawals/pending-count", tags=["Withdrawals"])
+def withdrawals_pending_count(a=Depends(admin)):
+    """Powers the sidebar notification badge that tells a super admin a disbursement is waiting on them."""
+    if a.get("role") != "SuperAdmin":
+        return {"count": 0}
+    return {"count": db("SELECT count(*)::int AS n FROM withdrawals WHERE status='Pending'", one=True)["n"]}
+
+
+@app.get("/api/withdrawals", tags=["Withdrawals"])
+def withdrawals_list(a=Depends(admin)):
+    """Admins see only their own requests; super admins see everyone's, so they can act on pending ones."""
+    if a.get("role") == "SuperAdmin":
+        return db(WD + " ORDER BY w.id DESC LIMIT 500")
+    return db(WD + " WHERE w.admin_id=%s ORDER BY w.id DESC LIMIT 500", (a["aid"],))
+
+
+@app.post("/api/withdrawals", status_code=201, tags=["Withdrawals"])
+def withdrawals_create(b: WithdrawalIn, a=Depends(admin)):
+    """Any admin requests a withdrawal of company funds. A super admin is notified and must approve it to disburse."""
+    avail = _wallet()["available"]
+    if b.amount > avail:
+        raise HTTPException(400, f"That's more than the available balance of UGX {avail:,}.")
+    return db("""INSERT INTO withdrawals(admin_id,admin_username,amount,method,destination,notes)
+               VALUES(%s,%s,%s,%s,%s,%s) RETURNING *""",
+              (a["aid"], a["sub"], b.amount, b.method, b.destination, b.notes), one=True)
+
+
+@app.post("/api/withdrawals/{wid}/approve", tags=["Withdrawals"])
+def withdrawals_approve(wid: int, a=Depends(super_admin)):
+    """Super admin confirms the funds have been physically disbursed to the requesting admin."""
+    found(db("""UPDATE withdrawals SET status='Paid',processed_at=now(),processed_by=%s
+               WHERE id=%s AND status='Pending' RETURNING id""", (a["sub"], wid), one=True),
+          "Only pending requests can be approved (or the request was not found).")
+    return {"ok": True}
+
+
+@app.post("/api/withdrawals/{wid}/reject", tags=["Withdrawals"])
+def withdrawals_reject(wid: int, b: RejectIn, a=Depends(super_admin)):
+    found(db("""UPDATE withdrawals SET status='Rejected',processed_at=now(),processed_by=%s,reject_reason=%s
+               WHERE id=%s AND status='Pending' RETURNING id""", (a["sub"], b.reason, wid), one=True),
+          "Only pending requests can be rejected (or the request was not found).")
+    return {"ok": True}
+
+
 # ---------------------------------------------------------------- hotspots & sessions
 @app.get("/api/hotspots", tags=["Hotspots"])
 def hotspots_list(_=Depends(admin)):
@@ -704,7 +864,8 @@ def dashboard_stats(_=Depends(admin)):
       (SELECT COALESCE(sum(amount),0) FROM payments WHERE status='Completed' AND paid_at>={since('day')})::int AS revenue_today,
       (SELECT COALESCE(sum(amount),0) FROM payments WHERE status='Completed')::int AS revenue_total,
       (SELECT count(*) FROM sessions s WHERE{LIVE})::int AS active_sessions,
-      (SELECT count(*) FROM payments WHERE status='Pending')::int AS pending_payments""", one=True)
+      (SELECT count(*) FROM payments WHERE status='Pending')::int AS pending_payments,
+      (SELECT count(*) FROM withdrawals WHERE status='Pending')::int AS pending_withdrawals""", one=True)
 
 
 @app.get("/api/reports", tags=["Dashboard"])
